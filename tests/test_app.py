@@ -553,6 +553,89 @@ def test_explicit_environment_key_with_job_cluster_key_is_rejected(monkeypatch):
         parse_args()
 
 
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        pytest.param(["--task-type", "dbt"], "--check-upstream-tables requires --task-type notebook", id="native"),
+        pytest.param(["--split-by-tag", "domain:*"], "--check-upstream-tables cannot be combined", id="split"),
+    ],
+)
+def test_check_upstream_tables_rejects_unsupported_job_layouts(monkeypatch, capsys, extra_args, message):
+    monkeypatch.setattr("sys.argv", ["main.py", *REQUIRED_ARGS, "--check-upstream-tables", *extra_args])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "job_key", "state_path"),
+    [
+        pytest.param([], "dbt_sql_job", "${workspace.root_path}/dbt_factory_state/dbt_sql_job", id="template-key"),
+        pytest.param(
+            ["--new-job-name", "orders_job"],
+            "orders_job",
+            "${workspace.root_path}/dbt_factory_state/orders_job",
+            id="renamed-key",
+        ),
+    ],
+)
+def test_check_upstream_tables_records_in_the_bundle_deployment_folder(
+    monkeypatch, tmp_path, extra_args, job_key, state_path
+):
+    target_job_spec_path = tmp_path / "job_definition.yaml"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--dbt-manifest-path",
+            BASE_PATH + "/test_data/manifest.json",
+            "--input-job-spec-path",
+            BASE_PATH + "/test_data/job_definition_template.yaml",
+            "--target-job-spec-path",
+            str(target_job_spec_path),
+            "--check-upstream-tables",
+            *extra_args,
+        ],
+    )
+
+    main()
+
+    with open(target_job_spec_path, "r", encoding="utf-8") as file:
+        tasks = yaml.safe_load(file)["resources"]["jobs"][job_key]["tasks"]
+    assert {task["notebook_task"]["base_parameters"].get("state_path") for task in tasks} - {None} == {state_path}
+
+
+@pytest.mark.parametrize(
+    ("options", "clashing"),
+    [
+        pytest.param("--no-write-json", "--no-write-json", id="no-manifest-written"),
+        pytest.param("--defer --state=/prod", "--defer, --state", id="own-state"),
+        pytest.param("--warn-error", "--warn-error", id="warnings-as-errors"),
+        pytest.param('--warn-error-options={"error":"all"}', "--warn-error-options", id="warning-options"),
+    ],
+)
+def test_check_upstream_tables_rejects_dbt_options_it_relies_on(monkeypatch, tmp_path, options, clashing):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--dbt-manifest-path",
+            BASE_PATH + "/test_data/manifest.json",
+            "--input-job-spec-path",
+            BASE_PATH + "/test_data/job_definition_template.yaml",
+            "--target-job-spec-path",
+            str(tmp_path / "job_definition.yaml"),
+            "--check-upstream-tables",
+            f"--extra-dbt-command-options={options}",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match=f"cannot be combined with {clashing} in --extra-dbt-command-options"):
+        main()
+    assert not (tmp_path / "job_definition.yaml").exists()
+
+
 def test_job_cluster_key_alone_parses(monkeypatch):
     monkeypatch.setattr("sys.argv", ["main.py", *REQUIRED_ARGS, "--job-cluster-key", "foo"])
     args = parse_args()

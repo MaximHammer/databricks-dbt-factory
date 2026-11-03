@@ -45,6 +45,7 @@ def create_dbt_factory(
     notebook_path: str | None = None,
     bundle_tests: bool = False,
     dbt_options: str = "--target dev",
+    state_path: str | None = None,
 ) -> DbtFactory:
     resolver = DbtDependencyResolver()
     task_options = DbtTaskOptions(
@@ -62,4 +63,4 @@ def create_dbt_factory(
         "test": TestTaskFactory(resolver, task_options, dbt_options),
     }
 
-    return DbtFactory(task_factories, bundle_tests=bundle_tests)
+    return DbtFactory(task_factories, bundle_tests=bundle_tests, state_path=state_path)

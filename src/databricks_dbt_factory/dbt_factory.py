@@ -12,6 +12,11 @@ from databricks_dbt_factory.utils import DYNAMIC_VALUE_REFERENCE, MAX_JOB_TASKS,
 # The `unique_id` prefixes of resources a test can be attached to.
 _DBT_TEST_TARGET_PREFIXES = ("model.", "seed.", "snapshot.", "source.")
 
+# The materializations whose whole result is the relation dbt builds; a custom one can have other effects.
+_OBSERVABLE_MATERIALIZATIONS = frozenset(
+    {"table", "view", "incremental", "materialized_view", "streaming_table", "seed", "snapshot"}
+)
+
 
 def _flatten_fqn(fqn: list[str]) -> list[str]:
     """
@@ -79,6 +84,7 @@ class DbtFactory:
         self,
         task_factories: dict[str, TaskFactory],
         bundle_tests: bool = False,
+        state_path: str | None = None,
     ):
         """
         Initializes the dbt factory.
@@ -91,9 +97,13 @@ class DbtFactory:
                 resource and rewire downstream models/seeds/snapshots to depend on the upstream's
                 bundled test task so failing tests halt the DAG. When False, emit one task per
                 dbt test node.
+            state_path (str | None): Runtime directory where each model, seed or snapshot task records its last
+                successful build. When set, such a task builds only if something it depends on changed since that
+                build; see `_with_upstream_checks` for the tasks that always run.
         """
         self.task_factories = task_factories
         self.bundle_tests = bundle_tests
+        self.state_path = state_path
 
     def create_tasks(self, dbt_manifest: dict) -> list[dict]:
         """
@@ -109,7 +119,9 @@ class DbtFactory:
         Raises:
             ValueError: If the generated job would exceed Databricks' 1,000-task limit.
         """
-        tasks, _ = self._create_tasks(dbt_manifest)
+        tasks, _, resources_by_task_key = self._create_tasks(dbt_manifest)
+        if self.state_path:
+            tasks = self._with_upstream_checks(tasks, resources_by_task_key, dbt_manifest)
         if len(tasks) > MAX_JOB_TASKS:
             raise ValueError(
                 f"Databricks jobs support at most {MAX_JOB_TASKS:,} tasks; this manifest generates {len(tasks):,}. "
@@ -119,7 +131,95 @@ class DbtFactory:
 
     def create_partitions(self, dbt_manifest: dict, split_by_tags: Sequence[str]) -> list[JobPartition]:
         """Generates the tasks split into one job per dbt tag matching `split_by_tags`; see `partition_tasks`."""
-        return partition_tasks(*self._create_tasks(dbt_manifest), split_by_tags)
+        if self.state_path:
+            raise ValueError("Upstream table checks are not supported for jobs split by tag.")
+        tasks, placements, _ = self._create_tasks(dbt_manifest)
+        return partition_tasks(tasks, placements, split_by_tags)
+
+    def _with_upstream_checks(
+        self, tasks: list[DbtTask], resources_by_task_key: dict[str, str], dbt_manifest: dict
+    ) -> list[DbtTask]:
+        """
+        Adds the upstream check to each task that builds one relation whose result follows from what the check
+        observes: the tables it reads, its own table, its code and its command. Every other task always runs: tests,
+        so that a test of recency still fails when data stops arriving; Python models and custom materializations;
+        models and snapshots that read no table through `ref()` or `source()`, directly or through a view or ephemeral
+        model; and seeds over 1 MiB, which dbt checksums by path, so `state:modified` cannot see their contents change.
+        """
+        nodes = self._enabled_only(dbt_manifest.get("nodes", {}))
+        sources = self._enabled_only(dbt_manifest.get("sources", {}))
+        checked = []
+        for task in tasks:
+            unique_id = resources_by_task_key.get(task.task_key, "")
+            info = nodes.get(unique_id, {})
+            if (
+                info.get("resource_type") in self._GATEABLE_TYPES
+                and info.get("language", "sql") == "sql"
+                and (info.get("config") or {}).get("materialized") in _OBSERVABLE_MATERIALIZATIONS
+                and (info.get("checksum") or {}).get("name") != "path"
+            ):
+                upstream = self._upstream_relations(unique_id, nodes, sources)
+                if upstream is not None:
+                    task = replace(
+                        task,
+                        state_path=self.state_path,
+                        state_upstream=upstream,
+                        state_relation=list(self._relation(info, unique_id)),
+                    )
+            checked.append(task)
+        return checked
+
+    @classmethod
+    def _upstream_relations(cls, unique_id: str, nodes: dict, sources: dict) -> list[list[str]] | None:
+        """
+        Returns the relations a node reads as `[catalog, schema, name, kind]`, where `kind` is `source` for tables
+        the project does not build, or None when they cannot all be observed: a model or snapshot that reads none,
+        or reads a view or ephemeral model that declares no input. Views and ephemeral models are read through to
+        their inputs: a view's Unity Catalog timestamp moves only when the view is redefined.
+        """
+        kinds: dict[tuple[str, str, str], str] = {}
+        pending = list(cls._parents(nodes[unique_id]))
+        seen: set[str] = set()
+        while pending:
+            parent = pending.pop()
+            if parent in seen:
+                continue
+            seen.add(parent)
+            if parent in sources:
+                kinds[cls._relation(sources[parent], parent)] = "source"
+                continue
+            # Functions and other parents that are not relations hold no data of their own.
+            info = nodes.get(parent)
+            if info is None:
+                continue
+            materialized = (info.get("config") or {}).get("materialized")
+            if materialized != "ephemeral":
+                kinds.setdefault(cls._relation(info, parent), "dbt")
+            if materialized in {"ephemeral", "view"}:
+                if not cls._parents(info):
+                    return None
+                pending.extend(cls._parents(info))
+        if not kinds and nodes[unique_id].get("resource_type") != "seed":
+            return None
+        return [[*relation, kind] for relation, kind in sorted(kinds.items())]
+
+    @staticmethod
+    def _parents(info: dict) -> list[str]:
+        return (info.get("depends_on") or {}).get("nodes", [])
+
+    @staticmethod
+    def _relation(info: dict, unique_id: str) -> tuple[str, str, str]:
+        name = info.get("identifier") if info.get("resource_type") == "source" else info.get("alias")
+        catalog, schema, table = (
+            str(part or "").lower() for part in (info.get("database"), info.get("schema"), name or info.get("name"))
+        )
+        relation = (catalog, schema, table)
+        if not all(relation) or any(character in part for part in relation for character in "'\\{}"):
+            raise ValueError(
+                f"Cannot check {unique_id!r} for upstream changes: its relation {'.'.join(relation)!r} needs a "
+                f"catalog, a schema and a name, none containing a quote, backslash or brace."
+            )
+        return relation
 
     _GATEABLE_TYPES = frozenset({"model", "seed", "snapshot"})
     _DBT_TEST_TARGET_PREFIXES = _DBT_TEST_TARGET_PREFIXES
@@ -683,7 +783,7 @@ class DbtFactory:
             f"resources, so the task could run another task's resource."
         )
 
-    def _create_tasks(self, dbt_manifest: dict) -> tuple[list[DbtTask], dict[str, TaskPlacement]]:
+    def _create_tasks(self, dbt_manifest: dict) -> tuple[list[DbtTask], dict[str, TaskPlacement], dict[str, str]]:
         """
         Builds `DbtTask` instances from the manifest, applying the bundling and gating policies.
 
@@ -691,8 +791,8 @@ class DbtFactory:
             dbt_manifest (dict): Parsed dbt manifest content.
 
         Returns:
-            tuple[list[DbtTask], dict[str, TaskPlacement]]: `DbtTask` instances (not yet rendered to dicts), and
-            the placement of each by task key.
+            tuple[list[DbtTask], dict[str, TaskPlacement], dict[str, str]]: `DbtTask` instances (not yet rendered
+            to dicts), the placement of each by task key, and the resource of each task that runs one.
         """
         dbt_nodes = self._enabled_only(dbt_manifest.get("nodes", {}))
         dbt_sources = self._enabled_only(dbt_manifest.get("sources", {}))
@@ -758,7 +858,11 @@ class DbtFactory:
         elif "test" in self.task_factories:
             tasks.extend(self._build_unit_test_tasks(dbt_unit_tests, task_keys, peers))
 
-        return tasks, self._placements(peers, task_keys, bundled_test_keys)
+        return (
+            tasks,
+            self._placements(peers, task_keys, bundled_test_keys),
+            {task_key: full_name for full_name, task_key in task_keys.items()},
+        )
 
     @staticmethod
     def _placements(

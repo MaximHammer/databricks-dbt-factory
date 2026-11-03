@@ -28,6 +28,7 @@ import random
 import re
 import runpy
 import shlex
+import shutil
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -2515,11 +2516,10 @@ class _NotebookWidgets:
     """The widget surface used by the packaged runner."""
 
     def __init__(self, values: dict[str, str]):
-        self._values = values
+        self._values = dict(values)
 
-    @staticmethod
-    def text(_name: str, _default: str) -> None:
-        return None
+    def text(self, name: str, default: str) -> None:
+        self._values.setdefault(name, default)
 
     def get(self, name: str) -> str:
         return self._values[name]
@@ -2851,3 +2851,463 @@ def test_random_gating_layouts_never_emit_a_cycle(tmp_path, seed):
 
     for bundle_tests in (False, True):
         _assert_acyclic(manifest, bundle_tests)
+
+
+_STATE_BUILD_VERBS = ("run", "seed", "snapshot", "test")
+_UPSTREAM_MODELS = {
+    "stg_orders.sql": "{{ config(materialized='ephemeral') }}\nselect * from {{ source('raw', 'orders') }}\n",
+    "orders_view.sql": "{{ config(materialized='view') }}\nselect * from {{ ref('stg_orders') }}\n",
+    "orders.sql": "{{ config(materialized='table', alias='orders_final') }}\nselect * from {{ ref('orders_view') }}\n",
+    "report.sql": "select count(*) as n from {{ ref('orders') }}\n",
+}
+_UPSTREAM_SOURCES_YML = """\
+version: 2
+sources:
+  - name: raw
+    tables:
+      - name: orders
+        identifier: orders_v2
+"""
+
+
+def _upstream_project(root: Path, models: dict[str, str] | None = None) -> dict:
+    root.mkdir(exist_ok=True)
+    _write_project(root, models or _UPSTREAM_MODELS)
+    (root / "models" / "sources.yml").write_text(_UPSTREAM_SOURCES_YML, encoding="utf-8")
+    return _parse(root)
+
+
+def _upstream_tasks(root: Path, state: Path | None, bundle_tests: bool = False) -> dict[str, dict]:
+    manifest = json.loads((root / "target" / "manifest.json").read_text(encoding="utf-8"))
+    factory = create_dbt_factory(
+        task_type="notebook",
+        notebook_path="./run_dbt_command.py",
+        state_path=str(state) if state else None,
+        bundle_tests=bundle_tests,
+    )
+    return {task["task_key"]: task for task in factory.create_tasks(manifest)}
+
+
+def _execute_upstream_runner(
+    monkeypatch,
+    root: Path,
+    task: dict,
+    catalog: dict,
+    commands: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    failing_lookups: tuple[int, ...] = (),
+) -> dict:
+    """
+    Executes the packaged notebook for one upstream-checked task against a stand-in Unity Catalog, `catalog`
+    (`catalog.schema.name` to `(table_type, last_altered)`), which answers each lookup for the relations it names;
+    the lookups numbered in `failing_lookups`, counting from 0, fail. Each build command is replayed through `dbt ls`,
+    so what it would build is dbt's own answer under the task's `--state`, and one that selects anything rewrites the
+    task's own table, moving its `last_altered`. Like a real build command, even one that selects nothing (verified on
+    dbt 1.12.6), the replay leaves the project's manifest in the target path. Returns what each build command
+    selected, the catalog after the run, every lookup's arguments and the order of the dbt commands invoked.
+    """
+    from dbt.cli.main import dbtRunner, dbtRunnerResult  # pylint: disable=import-outside-toplevel
+
+    catalog = dict(catalog)
+    parameters = dict(task["notebook_task"]["base_parameters"])
+    own = ".".join(json.loads(parameters["state_relation"]))
+    calls: dict[str, list] = {"built": [], "lookups": [], "invoked": []}
+
+    class _UpstreamRunner(dbtRunner):
+        def invoke(self, args, **kwargs):
+            calls["invoked"].append(args[0])
+            if args[0] == "show":
+                calls["lookups"].append(list(args))
+                if len(calls["lookups"]) - 1 in failing_lookups:
+                    return dbtRunnerResult(success=False, exception=RuntimeError("PERMISSION_DENIED: USE SCHEMA"))
+                named = {".".join(name) for name in re.findall(r"\('([^']*)', '([^']*)', '([^']*)'\)", args[2])}
+                rows = [(*name.split("."), *catalog[name]) for name in sorted(named & set(catalog))]
+                table = SimpleNamespace(rows=rows)
+                return dbtRunnerResult(
+                    success=True, result=SimpleNamespace(results=[SimpleNamespace(agate_table=table)])
+                )
+            if args[0] in _STATE_BUILD_VERBS:
+                resource_types = ["test", "unit_test"] if args[0] == "test" else [args[0].replace("run", "model")]
+                listed = super().invoke(
+                    [
+                        "ls",
+                        *[arg for arg in args[1:] if arg != "--full-refresh"],
+                        "--output",
+                        "json",
+                        "--output-keys",
+                        "unique_id",
+                        "--quiet",
+                        *[part for kind in resource_types for part in ("--resource-type", kind)],
+                    ],
+                    **kwargs,
+                )
+                assert listed.success, listed.exception
+                calls["built"].append(sorted(json.loads(entry)["unique_id"] for entry in listed.result))
+                if calls["built"][-1]:
+                    table_type, altered = catalog.get(own, ("MANAGED", 0))
+                    catalog[own] = (table_type, altered + 1)
+                shutil.copyfile(
+                    root / "target" / "manifest.json", Path(os.environ["DBT_TARGET_PATH"]) / "manifest.json"
+                )
+                return dbtRunnerResult(success=True)
+            return super().invoke(args, **kwargs)
+
+    values = {
+        **parameters,
+        "project_directory": "",
+        "profiles_directory": str(root),
+    }
+    if commands is not None:
+        values["dbt_commands"] = json.dumps(commands)
+    runner_path = (
+        Path(__file__).resolve().parents[2] / "src" / "databricks_dbt_factory" / "notebook" / "run_dbt_command.py"
+    )
+    with monkeypatch.context() as execution:
+        execution.chdir(root)
+        execution.setattr("databricks.sdk.WorkspaceClient", _StubWorkspaceClient)
+        execution.setattr("dbt.cli.main.dbtRunner", _UpstreamRunner)
+        for name in ("DBT_ACCESS_TOKEN", "DBT_HOST", "DBT_TARGET_PATH", "DBT_LOG_PATH"):
+            execution.setenv(name, os.environ.get(name, ""))
+        for name, value in (env or {}).items():
+            execution.setenv(name, value)
+        runpy.run_path(str(runner_path), init_globals={"dbutils": _notebook_dbutils(values)})
+    return {**calls, "catalog": catalog}
+
+
+class _UpstreamWorld:
+    """Runs a project's upstream-checked tasks one after another against one stand-in Unity Catalog."""
+
+    def __init__(self, monkeypatch, root: Path, state: Path, catalog: dict):
+        self.monkeypatch, self.root, self.state, self.catalog = monkeypatch, root, state, dict(catalog)
+        self.last: dict = {}
+
+    def run(self, task_key: str, **kwargs) -> list[list[str]]:
+        task = _upstream_tasks(self.root, self.state)[task_key]
+        self.last = _execute_upstream_runner(self.monkeypatch, self.root, task, self.catalog, **kwargs)
+        self.catalog = self.last["catalog"]
+        return self.last["built"]
+
+    def record(self, task_key: str) -> dict:
+        return json.loads((self.state / "tasks" / f"{task_key}.json").read_text(encoding="utf-8"))
+
+    def commands(self, task_key: str) -> list[str]:
+        task = _upstream_tasks(self.root, self.state)[task_key]
+        return json.loads(task["notebook_task"]["base_parameters"]["dbt_commands"])
+
+
+def _rendered_relation(manifest: dict, unique_id: str) -> list[str]:
+    info = manifest["nodes"].get(unique_id) or manifest["sources"][unique_id]
+    return [part.strip("`").lower() for part in info["relation_name"].split(".")]
+
+
+def _rendered_name(manifest: dict, unique_id: str) -> str:
+    return ".".join(_rendered_relation(manifest, unique_id))
+
+
+def test_upstream_checks_add_no_tasks_and_keep_the_dbt_commands_unchanged(tmp_path):
+    root = tmp_path / "project"
+    _upstream_project(root)
+
+    checked, plain = _upstream_tasks(root, tmp_path / "state"), _upstream_tasks(root, None)
+
+    assert sorted(checked) == sorted(plain)
+    with_state = []
+    for key, task in plain.items():
+        parameters = dict(checked[key]["notebook_task"]["base_parameters"])
+        state = {
+            name: parameters.pop(name)
+            for name in ("state_path", "state_key", "state_upstream", "state_relation")
+            if name in parameters
+        }
+        assert parameters == task["notebook_task"]["base_parameters"]
+        assert checked[key]["depends_on"] == task["depends_on"]
+        if state:
+            assert (state["state_path"], state["state_key"]) == (str(tmp_path / "state"), key)
+            with_state.append(key)
+    assert sorted(with_state) == ["orders_model", "orders_view_model", "report_model"]
+
+
+@pytest.mark.parametrize("identifier", ["orders'v2", "orders{v2}", "orders\\v2"])
+def test_upstream_checks_refuse_a_relation_name_the_lookup_cannot_quote(tmp_path, identifier):
+    root = tmp_path / "project"
+    root.mkdir()
+    _write_project(root, _UPSTREAM_MODELS)
+    (root / "models" / "sources.yml").write_text(
+        _UPSTREAM_SOURCES_YML.replace("identifier: orders_v2", f"identifier: {json.dumps(identifier)}"),
+        encoding="utf-8",
+    )
+    _parse(root)
+
+    with pytest.raises(ValueError, match=r"Cannot check 'source\.probe\.raw\.orders' for upstream changes"):
+        _upstream_tasks(root, tmp_path / "state")
+
+
+def test_upstream_checks_refuse_jobs_split_by_tag_and_native_dbt_tasks(tmp_path):
+    root = tmp_path / "project"
+    _upstream_project(root)
+    manifest = json.loads((root / "target" / "manifest.json").read_text(encoding="utf-8"))
+
+    with pytest.raises(ValueError, match="not supported for jobs split by tag"):
+        create_dbt_factory(task_type="notebook", notebook_path="./run.py", state_path="/state").create_partitions(
+            manifest, ["domain:*"]
+        )
+    with pytest.raises(ValueError, match="needs the notebook runner"):
+        create_dbt_factory(task_type="dbt", state_path="/state").create_tasks(manifest)
+
+
+def test_upstream_checks_name_each_relation_the_way_dbt_renders_it(tmp_path):
+    manifest = _upstream_project(tmp_path / "project")
+    tasks = _upstream_tasks(tmp_path / "project", tmp_path / "state")
+
+    def checked(task_key: str) -> tuple[list, list]:
+        parameters = tasks[task_key]["notebook_task"]["base_parameters"]
+        return json.loads(parameters["state_upstream"]), json.loads(parameters["state_relation"])
+
+    source = [*_rendered_relation(manifest, "source.probe.raw.orders"), "source"]
+    view = [*_rendered_relation(manifest, "model.probe.orders_view"), "dbt"]
+    assert checked("orders_model") == (sorted([source, view]), _rendered_relation(manifest, "model.probe.orders"))
+    assert checked("report_model") == (
+        [[*_rendered_relation(manifest, "model.probe.orders"), "dbt"]],
+        _rendered_relation(manifest, "model.probe.report"),
+    )
+
+
+_CUSTOM_MATERIALIZATION = (
+    "{% materialization audited_table, default %}{{ return({'relations': []}) }}{% endmaterialization %}\n"
+)
+
+
+@pytest.mark.parametrize("bundle_tests", [False, True])
+def test_upstream_checks_leave_every_task_whose_result_they_cannot_observe_to_run(tmp_path, bundle_tests):
+    root = tmp_path / "project"
+    models = {
+        "orders.sql": "{{ config(materialized='table') }}\nselect * from {{ source('raw', 'orders') }}\n",
+        "report.sql": "select count(*) as n from {{ ref('orders') }}\n",
+        "recent_orders.sql": "select * from {{ ref('orders') }} where order_date >= current_date() - 30\n",
+        "constants.sql": "select 1 as id\n",
+        "hardcoded.sql": "select * from main.raw.orders_v2\n",
+        "raw_events.sql": "{{ config(materialized='view') }}\nselect * from main.raw.events\n",
+        "events_daily.sql": "{{ config(materialized='table') }}\nselect count(*) as n from {{ ref('raw_events') }}\n",
+        "lookup.sql": "{{ config(materialized='ephemeral') }}\nselect * from main.ref.lookup\n",
+        "enriched.sql": "select * from {{ ref('orders') }} join {{ ref('lookup') }} using (id)\n",
+        "audited.sql": "{{ config(materialized='audited_table') }}\nselect * from {{ ref('orders') }}\n",
+        "scored.py": "def model(dbt, session):\n    return dbt.ref('orders')\n",
+    }
+    root.mkdir()
+    _write_project(root, models)
+    (root / "models" / "sources.yml").write_text(_UPSTREAM_SOURCES_YML, encoding="utf-8")
+    (root / "models" / "schema.yml").write_text(
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n      - name: id\n        data_tests: [not_null]\n",
+        encoding="utf-8",
+    )
+    (root / "macros").mkdir()
+    (root / "macros" / "audited_table.sql").write_text(_CUSTOM_MATERIALIZATION, encoding="utf-8")
+    (root / "seeds").mkdir()
+    (root / "seeds" / "countries.csv").write_text("id,name\n1,France\n", encoding="utf-8")
+    # Over 1 MiB, so dbt checksums it by path and `state:modified` cannot see its contents change.
+    (root / "seeds" / "big.csv").write_text(
+        "id,name\n" + "".join(f"{i},name_{i}\n" for i in range(80_000)), encoding="utf-8"
+    )
+    (root / "snapshots").mkdir()
+    (root / "snapshots" / "orders_history.sql").write_text(
+        "{% snapshot orders_history %}\n"
+        "{{ config(target_schema='snapshots', strategy='check', unique_key='id', check_cols=['status']) }}\n"
+        "select * from {{ source('raw', 'orders') }}\n{% endsnapshot %}\n",
+        encoding="utf-8",
+    )
+    _parse(root)
+
+    tasks = _upstream_tasks(root, tmp_path / "state", bundle_tests)
+
+    test_task = "orders_test" if bundle_tests else "not_null_orders_id_test"
+    assert {f"{name.split('.')[0]}_model" for name in models} | {"big_seed", test_task} <= set(tasks)
+    checked = sorted(key for key, task in tasks.items() if "state_path" in task["notebook_task"]["base_parameters"])
+    assert checked == [
+        "countries_seed",
+        "orders_history_snapshot",
+        "orders_model",
+        "recent_orders_model",
+        "report_model",
+    ]
+    for key, task in tasks.items():
+        parameters = task["notebook_task"]["base_parameters"]
+        if key not in checked:
+            assert not {"state_path", "state_upstream", "state_relation"} & set(parameters)
+
+
+def test_upstream_checks_build_a_task_only_when_a_table_it_reads_or_its_project_changed(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "project"
+    manifest = _upstream_project(root)
+    source, view, orders = (
+        _rendered_name(manifest, unique_id)
+        for unique_id in ("source.probe.raw.orders", "model.probe.orders_view", "model.probe.orders")
+    )
+    world = _UpstreamWorld(
+        monkeypatch, root, tmp_path / "state", {source: ("MANAGED", 100), view: ("VIEW", 200), orders: ("MANAGED", 300)}
+    )
+
+    assert world.run("orders_view_model") == [["model.probe.orders_view"]]
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert "no successful build of this task is recorded" in capsys.readouterr().out
+    record = world.record("orders_model")
+    assert record["relations"] == {source: 100, view: 201}
+    assert record["own"] == 301
+    assert (world.state / "manifests" / record["manifest"] / "manifest.json").exists()
+
+    assert not world.run("orders_model")
+    assert "skipping: nothing this task depends on changed since its last successful build" in capsys.readouterr().out
+
+    world.catalog[source] = ("MANAGED", 101)
+    assert world.run("orders_view_model") == [["model.probe.orders_view"]]
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert f"{source} changed" in capsys.readouterr().out
+    assert not world.run("orders_model")
+
+    world.catalog[orders] = ("MANAGED", world.catalog[orders][1] + 50)
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert f"{orders} changed since this task last built it" in capsys.readouterr().out
+    assert not world.run("orders_model")
+
+    world.catalog[source] = ("MATERIALIZED_VIEW", 101)
+    assert not world.run("orders_model")
+    # A continuous pipeline appends to a streaming table without moving its last_altered (measured on Databricks).
+    world.catalog[source] = ("STREAMING_TABLE", 101)
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    world.catalog[source] = ("EXTERNAL", 101)
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert "is a EXTERNAL source, whose last_altered can miss data changes" in capsys.readouterr().out
+    world.catalog[source] = ("MANAGED", 101)
+    del world.catalog[orders]
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert f"{orders} does not exist" in capsys.readouterr().out
+    assert not world.run("orders_model")
+
+    (root / "models" / "orders.sql").write_text(
+        "{{ config(materialized='table', alias='orders_final') }}\nselect *, 1 as extra from {{ ref('orders_view') }}\n",
+        encoding="utf-8",
+    )
+    _parse(root)
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert "building only what state:modified+ selects against the project of its last build" in (
+        capsys.readouterr().out
+    )
+    assert world.run("orders_view_model") == [[]]
+    assert world.record("orders_view_model")["manifest"] == world.record("orders_model")["manifest"]
+    assert not world.run("orders_view_model")
+    assert "skipping" in capsys.readouterr().out
+
+
+def test_upstream_checks_build_again_when_the_dbt_command_or_its_context_changed(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "project"
+    region = "select count(*) as n, '{{ env_var(\"ORDERS_REGION\", \"eu\") }}' as region from {{ ref('orders') }}\n"
+    manifest = _upstream_project(root, {**_UPSTREAM_MODELS, "report.sql": region})
+    orders, report = (_rendered_name(manifest, f"model.probe.{name}") for name in ("orders", "report"))
+    world = _UpstreamWorld(monkeypatch, root, tmp_path / "state", {orders: ("MANAGED", 300), report: ("VIEW", 400)})
+    generated = world.commands("report_model")
+
+    assert world.run("report_model") == [["model.probe.report"]]
+    assert not world.run("report_model")
+
+    assert world.run("report_model", commands=[f"{generated[0]} --full-refresh"]) == [["model.probe.report"]]
+    assert "its dbt command changed" in capsys.readouterr().out
+    assert world.run("report_model") == [["model.probe.report"]]
+    assert not world.run("report_model")
+
+    assert world.run("report_model", env={"ORDERS_REGION": "us"}) == [["model.probe.report"]]
+    assert "an env var the project reads changed" in capsys.readouterr().out
+    assert not world.run("report_model", env={"ORDERS_REGION": "us"})
+
+    with open(root / "dbt_project.yml", "a", encoding="utf-8") as project:
+        project.write("vars:\n  vat_rate: 0.21\n")
+    _parse(root)
+    assert world.run("report_model", env={"ORDERS_REGION": "us"}) == [["model.probe.report"]]
+    assert "dbt_project.yml changed" in capsys.readouterr().out
+
+
+def test_upstream_checks_never_fail_a_successful_build_over_its_record(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "project"
+    manifest = _upstream_project(root)
+    catalog = {
+        _rendered_name(manifest, "source.probe.raw.orders"): ("MANAGED", 100),
+        _rendered_name(manifest, "model.probe.orders_view"): ("VIEW", 200),
+        _rendered_name(manifest, "model.probe.orders"): ("MANAGED", 300),
+    }
+    not_a_directory = tmp_path / "state_file"
+    not_a_directory.write_text("", encoding="utf-8")
+    world = _UpstreamWorld(monkeypatch, root, not_a_directory, catalog)
+
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert "could not record this build" in capsys.readouterr().out
+    assert world.run("orders_model") == [["model.probe.orders"]]
+
+    world = _UpstreamWorld(monkeypatch, root, tmp_path / "state", world.catalog)
+    assert world.run("orders_model", failing_lookups=(1,)) == [["model.probe.orders"]]
+    assert "not recording this build" in capsys.readouterr().out
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert not world.run("orders_model")
+
+    (world.state / "tasks" / "orders_model.json").write_text("[]", encoding="utf-8")
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert "no successful build of this task is recorded" in capsys.readouterr().out
+
+    assert world.run("orders_model", failing_lookups=(0,)) == [["model.probe.orders"]]
+    assert "PERMISSION_DENIED: USE SCHEMA" in capsys.readouterr().out
+
+    (root / "target" / "partial_parse.msgpack").unlink()
+    assert world.run("orders_model") == [["model.probe.orders"]]
+    assert "target/partial_parse.msgpack" in capsys.readouterr().out
+
+
+def test_upstream_checks_look_tables_up_after_dbt_deps_on_the_task_target(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    manifest = _upstream_project(root)
+    orders, report = (_rendered_name(manifest, f"model.probe.{name}") for name in ("orders", "report"))
+    world = _UpstreamWorld(monkeypatch, root, tmp_path / "state", {orders: ("MANAGED", 300), report: ("VIEW", 400)})
+    commands = ["dbt deps", *world.commands("report_model")]
+
+    assert world.run("report_model", commands=commands) == [["model.probe.report"]]
+    assert world.last["invoked"][:2] == ["deps", "show"]
+    lookup = world.last["lookups"][0]
+    assert (lookup[lookup.index("--target") + 1], lookup[lookup.index("--profiles-dir") + 1]) == ("dev", str(root))
+    assert "--no-populate-cache" in lookup
+    assert not world.run("report_model", commands=commands)
+    assert world.last["invoked"] == ["deps", "show"]
+
+
+def test_upstream_checks_keep_each_manifest_while_a_record_refers_to_it(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    manifest = _upstream_project(root)
+    world = _UpstreamWorld(
+        monkeypatch,
+        root,
+        tmp_path / "state",
+        {
+            _rendered_name(manifest, "source.probe.raw.orders"): ("MANAGED", 100),
+            _rendered_name(manifest, "model.probe.orders_view"): ("VIEW", 200),
+            _rendered_name(manifest, "model.probe.orders"): ("MANAGED", 300),
+            _rendered_name(manifest, "model.probe.report"): ("VIEW", 400),
+        },
+    )
+
+    def deploy(extra: int) -> str:
+        (root / "models" / "report.sql").write_text(
+            f"select count(*) as n, {extra} as extra from {{{{ ref('orders') }}}}\n", encoding="utf-8"
+        )
+        _parse(root)
+        assert world.run("report_model") == [["model.probe.report"]]
+        return world.record("report_model")["manifest"]
+
+    def stored() -> list[str]:
+        return sorted(path.name for path in (world.state / "manifests").iterdir())
+
+    world.run("orders_model")
+    world.run("report_model")
+    first = world.record("orders_model")["manifest"]
+    deploy(1)
+    third = deploy(2)
+    assert stored() == sorted([first, third])
+
+    assert world.run("orders_model") == [[]]
+    assert world.record("orders_model")["manifest"] == third
+    fourth = deploy(3)
+    assert stored() == sorted([third, fourth])

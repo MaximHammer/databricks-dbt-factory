@@ -24,6 +24,20 @@ def _notebook_task_with_serialized_base_parameters_size(size: int) -> DbtTask:
     return DbtTask(task_key="large_test_bundle", commands=[command], options=options)
 
 
+def test_notebook_task_with_upstream_checks_needs_its_own_relation():
+    options = DbtTaskOptions(task_type="notebook", notebook_path="./runner.py")
+    task = DbtTask(
+        task_key="orders_model",
+        commands=["dbt run --select orders"],
+        options=options,
+        state_path="/state",
+        state_upstream=[["main", "raw", "orders", "source"]],
+    )
+
+    with pytest.raises(ValueError, match="needs its own relation"):
+        task.to_dict()
+
+
 def test_notebook_task_with_job_cluster_key():
     options = DbtTaskOptions(
         task_type="notebook",
