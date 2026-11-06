@@ -18,6 +18,7 @@ It reads your dbt manifest and generates a new job specification — a Declarati
 - [How it works](#how-it-works)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Skipping unchanged tasks](#skipping-unchanged-tasks)
 - [Handling dbt tests](#handling-dbt-tests)
 - [Task types](#task-types)
 - [End-to-end example](#end-to-end-example)
@@ -368,6 +369,7 @@ databricks_dbt_factory  \
 - `--no-run-tests` (flag, default: tests enabled): Skip generating dbt test tasks. Tests are included by default.
 - `--bundle-tests` (flag, default: disabled): **Performance boost** — bundle exact selectors for data tests with one testable parent (model, seed, snapshot, or source) and unit tests into one Databricks task per parent, using at most one `dbt test` union per indirect-selection mode. Data tests with zero or multiple testable parents remain standalone. Fewer Databricks tasks means fewer task startups and dbt cold starts. Downstream models/seeds/snapshots gate on the upstream's `<resource>_test` task. See [Handling dbt tests](#handling-dbt-tests).
 - `--split-by-tag` (type: str, optional, repeatable): Split the job into one job per dbt tag matching the value, an exact tag or a glob pattern. See [Splitting into several jobs](#splitting-into-several-jobs).
+- `--check-upstream-tables` (flag, default: disabled): Skip a model, seed or snapshot task when nothing it depends on changed since its last successful build. See [Skipping unchanged tasks](#skipping-unchanged-tasks).
 - `--enable-dbt-deps` (flag, default: disabled): Run `dbt deps` before each task.
 - `--dbt-tasks-deps` (type: str, optional, default: None): Comma separated list of tasks for which dbt deps should be run (e.g. "diamonds_prices,second_dbt_model"). Only in effect if `--enable-dbt-deps` is set.
 - `--dry-run` (flag, default: disabled): Print the generated tasks, grouped by job with `--split-by-tag`, without updating the job spec file.
@@ -440,6 +442,67 @@ databricks_dbt_factory ... --split-by-tag 'domain:*'
 - Repairing a failed orchestrator run re-runs the failed tasks inside the failed job; Databricks does not allow
   repairing that job's own run. To rebuild its models as well, for example after fixing source data, run the
   orchestrator again, optionally only for the affected jobs (`run_now` with `only`).
+
+## Skipping unchanged tasks
+
+With `--check-upstream-tables`, a model, seed or snapshot task builds only when something its result depends on
+changed since its own last successful build. Otherwise it skips the build after one metadata query. Your dbt project
+stays as it is.
+
+```shell
+databricks_dbt_factory ... --check-upstream-tables
+```
+
+A task builds when, since its last successful build:
+
+- a table it reads changed in Unity Catalog,
+- its own table was dropped or written by anything else,
+- a deploy changed its code, as dbt's `state:modified+` sees it, or
+- its dbt command (for example an added `--full-refresh`), the dbt version, `dbt_project.yml` or an env var the
+  project reads changed.
+
+These tasks always run, because nothing the check observes tells when their result changes:
+
+- tests, so that a recency test still fails when data stops arriving,
+- models that read no table through `ref()` or `source()`, directly or through a view or ephemeral model,
+- seeds over 1 MiB, whose changes dbt's `state:modified` cannot see,
+- Python models and custom materializations.
+
+How a task decides:
+
+1. The factory lists the tables each task reads from the manifest: every `ref()` and `source()`, followed through
+   views and ephemeral models to the tables behind them.
+2. At run time the task looks up when each of those tables and its own table last changed (`last_altered`), in one
+   query to `system.information_schema.tables` over its own dbt connection.
+3. It compares those values, its dbt command, the dbt version, `dbt_project.yml` and the env vars with what it
+   recorded at its last successful build. If nothing differs and the deployed project is the same, it skips. After a
+   deploy, dbt's `state:modified+` decides, against the manifest of that build.
+4. After a successful build, it looks up its own table again and records everything in the bundle's deployment
+   folder, `${workspace.root_path}/dbt_factory_state/<job key>`. If recording fails, the task still succeeds and
+   builds again on its next run. Delete that folder to rebuild everything on the next run.
+
+Requirements:
+
+- Notebook tasks deployed with `databricks bundle deploy`, including `target/partial_parse.msgpack` (see
+  [Faster parsing on large projects](#faster-parsing-on-large-projects-pre-built-msgpack)). The msgpack identifies
+  the deployed project; without it every task builds.
+- The job's identity can write to the bundle's deployment folder.
+
+Good to know:
+
+- As in dbt State by default, a model whose SQL reads the current time, such as `current_date()`, rebuilds when its
+  inputs or code change, not as time passes, and a skipped model's hooks do not run.
+- A model that reads tables through `ref()` or `source()` and also names one directly in SQL is not rebuilt when only
+  that one changes.
+- A source that is a streaming table, an external table, a view or a federated table counts as changed on every run,
+  so everything that reads it builds. A materialized view counts as changed after each refresh.
+- A task that builds changes its table, so the tasks downstream of it build too.
+- Changes that leave the data as it was, such as a compacting `OPTIMIZE`, a comment or a tag on an input table, also
+  trigger a build.
+- A write shows in `last_altered` within a few seconds, well before the next task in the job looks it up. A write from
+  outside the job that lands in those seconds just before a lookup is picked up by the task's next run.
+- It cannot be combined with `--split-by-tag`, `--task-type dbt`, or `--no-write-json`, `--state`, `--defer`,
+  `--warn-error` or `--warn-error-options` in `--extra-dbt-command-options`.
 
 ## Handling dbt tests
 
@@ -657,7 +720,8 @@ Build the manifest and msgpack with the **exact same `dbt-databricks` version an
 tasks run**. If target, profile, vars, or environment can change the graph, build and deploy a separate
 pair for each context.
 Optionally add `--extra-dbt-command-options "--no-write-json --no-populate-cache"` to also skip JSON
-artifact writes and the warehouse relation-cache scan.
+artifact writes and the warehouse relation-cache scan (without `--no-write-json` when you use
+`--check-upstream-tables`).
 
 > **Note:** In this mode a task's run artifacts (`run_results.json`, compiled SQL, etc.) are written to
 > a private local dir and are **not** synced back to the shared workspace `target/`. The local dir is

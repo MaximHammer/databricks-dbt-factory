@@ -112,6 +112,11 @@ def render_partitioned_job_spec(
     return _dump(job_definition)
 
 
+def template_job_key(input_job_spec_path: str, new_job_name: str | None = None) -> str:
+    """Returns the key of the job whose tasks the factory generates, after any rename to `new_job_name`."""
+    return _load_template(input_job_spec_path, new_job_name)[2]
+
+
 def _run_job_task(partition: JobPartition, job_key: str) -> dict:
     return {
         "task_key": partition.name,

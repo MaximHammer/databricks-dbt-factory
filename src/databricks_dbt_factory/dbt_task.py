@@ -99,6 +99,9 @@ class DbtTask:
     commands: list[str]
     options: DbtTaskOptions
     depends_on: list[str] | None = None
+    state_path: str | None = None
+    state_upstream: list[list[str]] | None = None
+    state_relation: list[str] | None = None
 
     def to_dict(self) -> dict:
         """Converts the Task to a dictionary suitable for the job definition."""
@@ -118,6 +121,8 @@ class DbtTask:
         return spec
 
     def _to_dbt_dict(self) -> dict[str, Any]:
+        if self.state_path:
+            raise ValueError(f"Task {self.task_key!r} checks its upstream tables, which needs the notebook runner.")
         spec = self._base_spec()
         dbt_task: dict[str, Any] = {"commands": self.commands}
 
@@ -151,6 +156,13 @@ class DbtTask:
             base_parameters["project_directory"] = self.options.project_directory
         if self.options.profiles_directory:
             base_parameters["profiles_directory"] = self.options.profiles_directory
+        if self.state_path:
+            if not self.state_relation:
+                raise ValueError(f"Task {self.task_key!r} checks its upstream tables, which needs its own relation.")
+            base_parameters["state_path"] = self.state_path
+            base_parameters["state_key"] = self.task_key
+            base_parameters["state_upstream"] = json.dumps(self.state_upstream or [])
+            base_parameters["state_relation"] = json.dumps(self.state_relation)
 
         serialized_size = len(json.dumps(base_parameters, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         if serialized_size > _MAX_NOTEBOOK_BASE_PARAMETERS_BYTES:

@@ -15,6 +15,7 @@ from databricks_dbt_factory.job_spec import (
     render_job_spec,
     render_partitioned_job_spec,
     resolve_job_spec_destination,
+    template_job_key,
     write_job_spec,
 )
 from databricks_dbt_factory.utils import read_dbt_manifest
@@ -30,6 +31,8 @@ from databricks_dbt_factory.task_factory import (
 )
 
 _RUNNER_NOTEBOOK_FILENAME = "run_dbt_command.py"
+# The bundle's deployment folder, next to the `files/` that deploys sync; `state/` there is the bundle's own.
+_DEFAULT_STATE_ROOT = "${workspace.root_path}/dbt_factory_state"
 
 
 @dataclass(frozen=True)
@@ -156,7 +159,19 @@ def _create_dbt_factory(args: argparse.Namespace, output_plan: _OutputPlan, dbt_
     }
     if args.run_tests:
         task_factories["test"] = TestTaskFactory(resolver, task_options, dbt_options)
-    return DbtFactory(task_factories, bundle_tests=args.bundle_tests)
+    state_path = None
+    if args.check_upstream_tables:
+        options = {token.partition("=")[0] for token in shlex.split(args.extra_dbt_command_options)}
+        if clashing := sorted(
+            options & {"--defer", "--no-write-json", "--state", "--warn-error", "--warn-error-options"}
+        ):
+            raise ValueError(
+                f"--check-upstream-tables cannot be combined with {', '.join(clashing)} in "
+                "--extra-dbt-command-options: each task records the manifest dbt writes and passes its own --state, "
+                "and after a deploy dbt's state:modified+ may select nothing, which dbt warns about."
+            )
+        state_path = f"{_DEFAULT_STATE_ROOT}/{template_job_key(args.input_job_spec_path, args.new_job_name)}"
+    return DbtFactory(task_factories, bundle_tests=args.bundle_tests, state_path=state_path)
 
 
 def _validate_artifact_destinations(
@@ -216,8 +231,8 @@ def main():
         raise SystemExit(f"error: {error}") from error
 
     output_plan = _prepare_output_plan(args)
-    factory = _create_dbt_factory(args, output_plan, dbt_options)
     try:
+        factory = _create_dbt_factory(args, output_plan, dbt_options)
         generated, job_spec_artifact = _prepare_generated_artifacts(args, factory, output_plan)
     except (ValueError, FileNotFoundError) as error:
         raise SystemExit(f"error: {error}") from error
@@ -356,6 +371,18 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--check-upstream-tables",
+        action="store_true",
+        help=(
+            "Skip a model, seed or snapshot task when nothing it depends on changed since its last successful build: "
+            "the Unity Catalog `last_altered` of every table it reads and of its own table, its code as "
+            "`state:modified+` sees it, and its dbt command, dbt version, dbt_project.yml and env vars. Tests always "
+            "run, and so do models that read no declared table, seeds over 1 MiB, Python models and custom "
+            "materializations. Builds are recorded under `${workspace.root_path}/dbt_factory_state/<job key>`, the "
+            "bundle's deployment folder. Requires notebook tasks."
+        ),
+    )
+    parser.add_argument(
         "--enable-dbt-deps",
         action="store_true",
         help="Run `dbt deps` before each task.",
@@ -416,6 +443,9 @@ def parse_args():
     if args.job_cluster_key and args.environment_key is not None:
         parser.error("--job-cluster-key and --environment-key are mutually exclusive")
 
+    if args.check_upstream_tables:
+        _validate_upstream_checks(parser, args)
+
     input_spec, target_spec = Path(args.input_job_spec_path), Path(args.target_job_spec_path)
     in_place = input_spec.exists() and target_spec.exists() and input_spec.samefile(target_spec)
     if args.split_by_tag and not args.dry_run and in_place:
@@ -440,6 +470,13 @@ def parse_args():
             )
 
     return args
+
+
+def _validate_upstream_checks(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.task_type != "notebook":
+        parser.error("--check-upstream-tables requires --task-type notebook; the notebook runner runs the checks.")
+    if args.split_by_tag:
+        parser.error("--check-upstream-tables cannot be combined with --split-by-tag.")
 
 
 if __name__ == "__main__":
